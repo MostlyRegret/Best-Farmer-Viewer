@@ -1,1 +1,34 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Best Farmer Backup Viewer</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 20px; }
+      .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+      table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+      th, td { border: 1px solid #ddd; padding: 8px; text-align:left; }
+      img { max-width: 120px; max-height: 120px; border:1px solid #ddd; }
+      .muted { opacity: .7; }
+    </style>
+  </head>
+  <body>
+    <h2>Best Farmer Backup Viewer (local, no upload)</h2>
+
+    <div class="row">
+      <input id="zip" type="file" accept=".zip" />
+      <span id="status" class="muted">Choose a backup zip…</span>
+    </div>
+
+    <h3>Cattle</h3>
+    <div id="cattle"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+
+    <!-- sql.js: easiest is to host these two files yourself in /docs and reference them -->
+    <script src="./sql-wasm.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>
 
