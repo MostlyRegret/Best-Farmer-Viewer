@@ -1,3 +1,19 @@
+// docs/app.js
+//
+// Best Farmer Backup Viewer (ZIP + ranch.db + attachments)
+// - Loads a backup ZIP locally (no upload)
+// - Opens ranch.db using sql.js (WASM)
+// - Tabs: Cattle / Feed / Inventory / Breeding
+// - Inventory: pooled snapshot if available, otherwise legacy snapshot fallback
+// - Search box filters the currently displayed table (Breeding filters Exposures table)
+//
+// Requirements in /docs alongside this file:
+//   - index.html
+//   - sql-wasm.js
+//   - sql-wasm.wasm
+//
+// Uses JSZip from CDN in index.html
+
 const statusEl = document.getElementById("status");
 const inputEl = document.getElementById("zip");
 const tabsEl = document.getElementById("tabs");
@@ -9,8 +25,12 @@ const countPillEl = document.getElementById("countPill");
 
 let zipIndex = null; // Map<zipPath, JSZipObject>
 let db = null;
+
 let currentTab = "cattle";
-let lastRenderedRows = []; // for search filtering
+
+// For search filtering: we keep the *current* table rows/cols.
+// NOTE: On Breeding tab, this is wired to the Exposures table (most useful).
+let lastRenderedRows = [];
 let lastRenderedCols = [];
 let lastRenderedPhotoCol = null;
 
@@ -27,6 +47,15 @@ function escapeHtml(s) {
     .replaceAll('"', "&quot;");
 }
 
+function queryAll(sql, params = []) {
+  const stmt = db.prepare(sql);
+  stmt.bind(params);
+  const rows = [];
+  while (stmt.step()) rows.push(stmt.getAsObject());
+  stmt.free();
+  return rows;
+}
+
 function hasTable(tableName) {
   try {
     const rows = queryAll(
@@ -39,13 +68,12 @@ function hasTable(tableName) {
   }
 }
 
-function queryAll(sql, params = []) {
-  const stmt = db.prepare(sql);
-  stmt.bind(params);
-  const rows = [];
-  while (stmt.step()) rows.push(stmt.getAsObject());
-  stmt.free();
-  return rows;
+function setCountPill(filteredCount, totalCount) {
+  if (totalCount === filteredCount) {
+    countPillEl.textContent = `${totalCount} rows`;
+  } else {
+    countPillEl.textContent = `${filteredCount} / ${totalCount} rows`;
+  }
 }
 
 async function blobUrlFromZipPath(path) {
@@ -57,29 +85,30 @@ async function blobUrlFromZipPath(path) {
 
   const lower = path.toLowerCase();
   const mime =
-    lower.endsWith(".png") ? "image/png" :
-    lower.endsWith(".jpg") || lower.endsWith(".jpeg") ? "image/jpeg" :
-    lower.endsWith(".webp") ? "image/webp" :
-    lower.endsWith(".pdf") ? "application/pdf" :
-    "application/octet-stream";
+    lower.endsWith(".png")
+      ? "image/png"
+      : lower.endsWith(".jpg") || lower.endsWith(".jpeg")
+        ? "image/jpeg"
+        : lower.endsWith(".webp")
+          ? "image/webp"
+          : lower.endsWith(".pdf")
+            ? "application/pdf"
+            : "application/octet-stream";
 
   const blob = new Blob([bytes], { type: mime });
   return URL.createObjectURL(blob);
 }
 
-function setCountPill(filteredCount, totalCount) {
-  if (totalCount === filteredCount) {
-    countPillEl.textContent = `${totalCount} rows`;
-  } else {
-    countPillEl.textContent = `${filteredCount} / ${totalCount} rows`;
-  }
-}
-
+/**
+ * Renders a single table into the main view container.
+ * Sets search/filter globals for that table.
+ */
 function renderTable(rows, { photoPathKey = null, extraColTitle = "Photo" } = {}) {
-  lastRenderedRows = rows;
+  lastRenderedRows = rows || [];
   lastRenderedPhotoCol = photoPathKey;
 
   if (!rows || rows.length === 0) {
+    lastRenderedCols = [];
     viewEl.innerHTML = `<div class="muted">No rows.</div>`;
     setCountPill(0, 0);
     return;
@@ -96,6 +125,7 @@ function renderTable(rows, { photoPathKey = null, extraColTitle = "Photo" } = {}
   for (const r of rows) {
     html += "<tr>";
     for (const c of cols) html += `<td>${escapeHtml(r[c])}</td>`;
+
     if (photoPathKey) {
       const p = r[photoPathKey];
       if (!p) {
@@ -127,12 +157,18 @@ function renderTable(rows, { photoPathKey = null, extraColTitle = "Photo" } = {}
   }
 }
 
+/**
+ * Applies the search filter to the currently-rendered table
+ * without re-querying the DB.
+ */
 function applySearchFilter() {
   const q = (searchEl.value || "").trim().toLowerCase();
-  if (!lastRenderedRows.length) return;
 
+  // Nothing rendered
+  if (!lastRenderedRows.length || !lastRenderedCols.length) return;
+
+  // No query -> re-render the full set we stored
   if (!q) {
-    // re-render original without re-query
     renderTable(lastRenderedRows, { photoPathKey: lastRenderedPhotoCol });
     return;
   }
@@ -146,7 +182,6 @@ function applySearchFilter() {
     return false;
   });
 
-  // Render filtered
   renderTable(filtered, { photoPathKey: lastRenderedPhotoCol });
   setCountPill(filtered.length, lastRenderedRows.length);
 }
@@ -158,11 +193,16 @@ function setActiveTab(tab) {
   for (const btn of tabsEl.querySelectorAll("button.tabbtn")) {
     btn.classList.toggle("active", btn.dataset.tab === tab);
   }
-  // clear search when switching tabs
+
+  // Clear search when switching tabs
   searchEl.value = "";
 }
 
-function wireTabs() {
+let tabsWired = false;
+function wireTabsOnce() {
+  if (tabsWired) return;
+  tabsWired = true;
+
   tabsEl.addEventListener("click", async (e) => {
     const btn = e.target.closest("button.tabbtn");
     if (!btn) return;
@@ -171,30 +211,71 @@ function wireTabs() {
   });
 }
 
+function fmtDate(ms) {
+  if (!ms) return "";
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return String(ms);
+
+  // Your DB stores millis since epoch. Render as local date.
+  try {
+    const d = new Date(n);
+    if (Number.isNaN(d.getTime())) return String(ms);
+    return d.toISOString().slice(0, 10); // YYYY-MM-DD
+  } catch {
+    return String(ms);
+  }
+}
+
+function mapDateColumns(rows, cols) {
+  // Replace common timestamp columns with YYYY-MM-DD for readability
+  // (keeps values as strings for viewing/searching)
+  const dateCols = new Set(cols.filter((c) =>
+    c.endsWith("_date") || c === "date" || c.endsWith("_at") || c === "created_at"
+  ));
+  if (!dateCols.size) return rows;
+
+  return rows.map((r) => {
+    const out = { ...r };
+    for (const c of dateCols) {
+      if (out[c] != null && out[c] !== "") out[c] = fmtDate(out[c]);
+    }
+    return out;
+  });
+}
+
 async function renderTab(tab) {
   setActiveTab(tab);
 
   try {
     if (tab === "cattle") {
-      const rows = queryAll(`
+      if (!hasTable("cattle")) {
+        viewEl.innerHTML = `<div class="warn">This backup doesn’t have the cattle table.</div>`;
+        setCountPill(0, 0);
+        setStatus("Cattle table missing.", "warn");
+        return;
+      }
+
+      let rows = queryAll(`
         SELECT id, ear_tag, status, sex, role, group_name, cohort, photo_path
         FROM cattle
         ORDER BY ear_tag ASC
       `);
+      rows = mapDateColumns(rows, Object.keys(rows[0] || {}));
+
       renderTable(rows, { photoPathKey: "photo_path", extraColTitle: "Photo" });
       setStatus("Loaded Cattle.", "ok");
       return;
     }
 
     if (tab === "feed") {
-      // feed_entries + feed_lots
       if (!hasTable("feed_entries") || !hasTable("feed_lots")) {
         viewEl.innerHTML = `<div class="warn">This backup doesn’t have feed tables yet.</div>`;
         setCountPill(0, 0);
+        setStatus("Feed tables missing.", "warn");
         return;
       }
 
-      const rows = queryAll(`
+      let rows = queryAll(`
         SELECT
           fe.date,
           fe.group_name,
@@ -208,12 +289,13 @@ async function renderTab(tab) {
         LIMIT 2000
       `);
 
+      rows = mapDateColumns(rows, Object.keys(rows[0] || {}));
       renderTable(rows);
       setStatus("Loaded Feed (recent first).", "ok");
       return;
     }
 
-       if (tab === "inventory") {
+    if (tab === "inventory") {
       const hasPooled =
         hasTable("feed_inventory_pools") &&
         hasTable("feed_inventory_pool_txns") &&
@@ -227,11 +309,10 @@ async function renderTab(tab) {
         hasTable("feed_lots");
 
       // -------------------------
-      // POOLED INVENTORY (V12+)
+      // Try POOLED snapshot first (V12+)
       // -------------------------
       if (hasPooled) {
-        // Snapshot grouped by Storage + Feed Type + Unit
-        const snapshot = queryAll(`
+        const pooledSnapshot = queryAll(`
           SELECT
             s.name AS storage,
             fl.name AS feed_type,
@@ -252,77 +333,16 @@ async function renderTab(tab) {
           ORDER BY s.name ASC, fl.name ASC
         `);
 
-        if (snapshot.length > 0) {
-          renderTable(snapshot);
+        if (pooledSnapshot.length > 0) {
+          renderTable(pooledSnapshot);
           setStatus("Loaded Inventory snapshot (pooled).", "ok");
           return;
         }
-
-        // If empty, show diagnostics: do we have pools? do we have txns?
-        const counts = queryAll(`
-          SELECT
-            (SELECT COUNT(*) FROM feed_inventory_pools) AS pool_count,
-            (SELECT COUNT(*) FROM feed_inventory_pool_txns) AS txn_count
-        `);
-
-        const poolList = queryAll(`
-          SELECT
-            s.name AS storage,
-            fl.name AS feed_type,
-            fl.unit AS unit,
-            p.notes AS notes,
-            p.created_at AS created_at
-          FROM feed_inventory_pools p
-          JOIN feed_storages s ON s.id = p.storage_id
-          JOIN feed_lots fl ON fl.id = p.feed_lot_id
-          ORDER BY s.name ASC, fl.name ASC
-          LIMIT 500
-        `);
-
-        viewEl.innerHTML = `
-          <div class="warn">
-            No pooled inventory totals to show yet.
-          </div>
-          <div class="muted" style="margin-top:8px;">
-            Pools: <b>${counts[0]?.pool_count ?? 0}</b> •
-            Pool txns: <b>${counts[0]?.txn_count ?? 0}</b>
-          </div>
-          <div class="muted" style="margin-top:8px;">
-            If Pools is 0, you likely never added inventory into storage yet (or you’re on legacy inventory only).
-            If Pools &gt; 0 but txns is 0, pools exist but no ADD/REMOVE/ADJUST were saved.
-          </div>
-          <div style="margin-top:12px;">
-            <div class="pill">Pools found</div>
-            <div id="poolTable"></div>
-          </div>
-        `;
-
-        const poolTableHost = document.getElementById("poolTable");
-        if (!poolList.length) {
-          poolTableHost.innerHTML = `<div class="muted">No pools found.</div>`;
-          setCountPill(0, 0);
-        } else {
-          // render pools table (no photos)
-          const cols = Object.keys(poolList[0]);
-          let html = "<table><thead><tr>";
-          for (const c of cols) html += `<th>${escapeHtml(c)}</th>`;
-          html += "</tr></thead><tbody>";
-          for (const r of poolList) {
-            html += "<tr>";
-            for (const c of cols) html += `<td>${escapeHtml(r[c])}</td>`;
-            html += "</tr>";
-          }
-          html += "</tbody></table>";
-          poolTableHost.innerHTML = html;
-          setCountPill(poolList.length, poolList.length);
-        }
-
-        setStatus("Inventory: pooled tables found, but no totals.", "warn");
-        return;
+        // If pooled exists but empty, fall through to legacy.
       }
 
       // -------------------------
-      // LEGACY INVENTORY (V11)
+      // Fallback: LEGACY snapshot (V11 batches)
       // -------------------------
       if (hasLegacy) {
         const legacySnapshot = queryAll(`
@@ -351,52 +371,52 @@ async function renderTab(tab) {
           setStatus("Loaded Inventory snapshot (legacy batches).", "ok");
           return;
         }
-
-        const counts = queryAll(`
-          SELECT
-            (SELECT COUNT(*) FROM feed_inventory_lots) AS lot_count,
-            (SELECT COUNT(*) FROM feed_inventory_txns) AS txn_count
-        `);
-
-        viewEl.innerHTML = `
-          <div class="warn">Legacy inventory tables found, but no totals to show.</div>
-          <div class="muted" style="margin-top:8px;">
-            Lots: <b>${counts[0]?.lot_count ?? 0}</b> •
-            Txns: <b>${counts[0]?.txn_count ?? 0}</b>
-          </div>
-        `;
-        setCountPill(0, 0);
-        setStatus("Inventory: legacy tables found, but empty.", "warn");
-        return;
       }
 
       // -------------------------
-      // NONE FOUND
+      // Diagnostics if nothing to show
       // -------------------------
+      const pooledCounts = hasPooled
+        ? queryAll(`
+            SELECT
+              (SELECT COUNT(*) FROM feed_inventory_pools) AS pools,
+              (SELECT COUNT(*) FROM feed_inventory_pool_txns) AS pool_txns
+          `)[0]
+        : { pools: 0, pool_txns: 0 };
+
+      const legacyCounts = hasLegacy
+        ? queryAll(`
+            SELECT
+              (SELECT COUNT(*) FROM feed_inventory_lots) AS lots,
+              (SELECT COUNT(*) FROM feed_inventory_txns) AS txns
+          `)[0]
+        : { lots: 0, txns: 0 };
+
       viewEl.innerHTML = `
-        <div class="warn">
-          This backup doesn’t include inventory tables.
+        <div class="warn">No inventory totals to show.</div>
+        <div class="muted" style="margin-top:8px;">
+          Pooled: <b>${escapeHtml(pooledCounts.pools)}</b> pools • <b>${escapeHtml(pooledCounts.pool_txns)}</b> txns<br/>
+          Legacy: <b>${escapeHtml(legacyCounts.lots)}</b> lots • <b>${escapeHtml(legacyCounts.txns)}</b> txns
         </div>
         <div class="muted" style="margin-top:8px;">
-          Expected pooled (V12+): feed_inventory_pools + feed_inventory_pool_txns<br/>
-          or legacy (V11): feed_inventory_lots + feed_inventory_txns
+          If you expect inventory here, add inventory in the app, then export a fresh backup.
         </div>
       `;
       setCountPill(0, 0);
-      setStatus("Inventory: no inventory tables found.", "warn");
+      setStatus("Inventory: no totals available.", "warn");
       return;
     }
-
 
     if (tab === "breeding") {
       if (!hasTable("breeding_sessions") || !hasTable("breeding_exposures")) {
         viewEl.innerHTML = `<div class="warn">This backup doesn’t have breeding tables yet.</div>`;
         setCountPill(0, 0);
+        setStatus("Breeding tables missing.", "warn");
         return;
       }
 
       // Sessions summary
-      const sessions = queryAll(`
+      let sessions = queryAll(`
         SELECT
           group_name,
           start_date,
@@ -407,9 +427,10 @@ async function renderTab(tab) {
         ORDER BY start_date DESC
         LIMIT 200
       `);
+      sessions = mapDateColumns(sessions, Object.keys(sessions[0] || {}));
 
-      // Exposures (recent)
-      const exposures = queryAll(`
+      // Exposures (recent) — this is what search will filter
+      let exposures = queryAll(`
         SELECT
           session_id,
           cow_tag,
@@ -425,78 +446,76 @@ async function renderTab(tab) {
         ORDER BY created_at DESC
         LIMIT 500
       `);
+      exposures = mapDateColumns(exposures, Object.keys(exposures[0] || {}));
 
-      // Render both tables stacked
-      let html = `<div class="pill">Sessions</div>`;
-      viewEl.innerHTML = html;
-      // First table
-      const tmp1 = document.createElement("div");
-      viewEl.appendChild(tmp1);
-      // temporary swap render target
-      const prev = viewEl.innerHTML;
+      // Render stacked sections
+      viewEl.innerHTML = `
+        <div class="pill">Sessions</div>
+        <div id="sessionsHost" style="margin-top:10px;"></div>
+        <div style="height:14px;"></div>
+        <div class="pill">Exposures (most recent)</div>
+        <div id="exposuresHost" style="margin-top:10px;"></div>
+      `;
 
-      // render sessions into tmp1
-      (function renderInto(el, rows) {
-        if (!rows.length) {
-          el.innerHTML = `<div class="muted">No sessions.</div>`;
-          return;
-        }
-        const cols = Object.keys(rows[0]);
+      const sessionsHost = document.getElementById("sessionsHost");
+      const exposuresHost = document.getElementById("exposuresHost");
+
+      // Render sessions into sessionsHost (simple table, no photos)
+      if (!sessions.length) {
+        sessionsHost.innerHTML = `<div class="muted">No sessions.</div>`;
+      } else {
+        const cols = Object.keys(sessions[0]);
         let t = "<table><thead><tr>";
         for (const c of cols) t += `<th>${escapeHtml(c)}</th>`;
         t += "</tr></thead><tbody>";
-        for (const r of rows) {
+        for (const r of sessions) {
           t += "<tr>";
           for (const c of cols) t += `<td>${escapeHtml(r[c])}</td>`;
           t += "</tr>";
         }
         t += "</tbody></table>";
-        el.innerHTML = t;
-      })(tmp1, sessions);
+        sessionsHost.innerHTML = t;
+      }
 
-      const sep = document.createElement("div");
-      sep.style.marginTop = "14px";
-      sep.innerHTML = `<div class="pill">Exposures (most recent)</div>`;
-      viewEl.appendChild(sep);
-
-      const tmp2 = document.createElement("div");
-      viewEl.appendChild(tmp2);
-
-      // exposures with photos
+      // Render exposures into exposuresHost with photos
       if (!exposures.length) {
-        tmp2.innerHTML = `<div class="muted">No exposures.</div>`;
+        exposuresHost.innerHTML = `<div class="muted">No exposures.</div>`;
         setCountPill(0, 0);
+        setStatus("Loaded Breeding (no exposures).", "ok");
+        // Update search globals to empty
+        lastRenderedRows = [];
+        lastRenderedCols = [];
+        lastRenderedPhotoCol = null;
         return;
       }
-      // Use normal renderer for exposures
-      // (set globals for search to exposures table only)
-      tmp2.innerHTML = "";
-      // Hijack: render exposures into tmp2 by temporarily pointing viewEl
-      const oldView = viewEl;
-      // We'll render via helper that writes to a given element
-      const renderTableInto = (el, rows, photoKey) => {
-        lastRenderedRows = rows;
-        lastRenderedPhotoCol = photoKey;
-        lastRenderedCols = Object.keys(rows[0] || {});
 
-        let cols = lastRenderedCols;
+      // Set search globals to exposures
+      lastRenderedRows = exposures;
+      lastRenderedCols = Object.keys(exposures[0]);
+      lastRenderedPhotoCol = "cow_photo_path";
+      setCountPill(exposures.length, exposures.length);
+
+      // Build exposures table manually into exposuresHost so photos render from ZIP
+      {
+        const cols = lastRenderedCols;
         let h = "<table><thead><tr>";
         for (const c of cols) h += `<th>${escapeHtml(c)}</th>`;
         h += "<th>Photo</th></tr></thead><tbody>";
 
-        for (const r of rows) {
+        for (const r of exposures) {
           h += "<tr>";
           for (const c of cols) h += `<td>${escapeHtml(r[c])}</td>`;
-          const p = r[photoKey];
+          const p = r.cow_photo_path;
           if (!p) h += `<td class="muted">—</td>`;
           else h += `<td><img class="thumb" data-photo="${escapeHtml(p)}" alt="photo"/></td>`;
           h += "</tr>";
         }
+
         h += "</tbody></table>";
-        el.innerHTML = h;
+        exposuresHost.innerHTML = h;
 
         void (async () => {
-          const imgs = el.querySelectorAll("img[data-photo]");
+          const imgs = exposuresHost.querySelectorAll("img[data-photo]");
           for (const img of imgs) {
             const p = img.getAttribute("data-photo");
             const url = await blobUrlFromZipPath(p);
@@ -504,14 +523,16 @@ async function renderTab(tab) {
             else img.replaceWith(document.createTextNode("Missing"));
           }
         })();
+      }
 
-        setCountPill(rows.length, rows.length);
-      };
-
-      renderTableInto(tmp2, exposures, "cow_photo_path");
       setStatus("Loaded Breeding (sessions + exposures).", "ok");
       return;
     }
+
+    // Unknown tab
+    viewEl.innerHTML = `<div class="warn">Unknown tab: ${escapeHtml(tab)}</div>`;
+    setCountPill(0, 0);
+    setStatus("Unknown tab.", "warn");
   } catch (err) {
     console.error(err);
     setStatus(`Error rendering ${tab}: ${err.message || err}`, "err");
@@ -525,14 +546,16 @@ async function loadFromZipFile(file) {
   const bytes = await file.arrayBuffer();
   const zip = await JSZip.loadAsync(bytes);
 
-  // index entries for fast lookup (attachments)
+  // Index entries for fast lookup (attachments)
   zipIndex = new Map();
   zip.forEach((relativePath, entry) => {
     if (!entry.dir) zipIndex.set(relativePath, entry);
   });
 
-  // find ranch.db anywhere in zip by basename
-  const dbEntry = [...zipIndex.entries()].find(([name]) => name.split("/").pop() === "ranch.db");
+  // Find ranch.db anywhere in zip by basename
+  const dbEntry = [...zipIndex.entries()].find(
+    ([name]) => name.split("/").pop() === "ranch.db"
+  );
   if (!dbEntry) throw new Error("ZIP missing ranch.db");
 
   setStatus("Loading ranch.db into SQLite (WASM)…");
@@ -546,7 +569,8 @@ async function loadFromZipFile(file) {
   tabsEl.style.display = "";
   toolbarEl.style.display = "";
   viewCardEl.style.display = "";
-  wireTabs();
+
+  wireTabsOnce();
 
   // Default tab
   await renderTab("cattle");
