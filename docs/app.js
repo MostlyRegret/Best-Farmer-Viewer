@@ -213,42 +213,180 @@ async function renderTab(tab) {
       return;
     }
 
-    if (tab === "inventory") {
-      // pooled inventory snapshot (V12)
-      if (!hasTable("feed_inventory_pools") || !hasTable("feed_inventory_pool_txns")) {
-        viewEl.innerHTML = `<div class="warn">
-          This backup doesn’t have pooled inventory tables (V12).<br/>
-          If you still have legacy inventory, we can add a legacy view too.
-        </div>`;
-        setCountPill(0, 0);
+       if (tab === "inventory") {
+      const hasPooled =
+        hasTable("feed_inventory_pools") &&
+        hasTable("feed_inventory_pool_txns") &&
+        hasTable("feed_storages") &&
+        hasTable("feed_lots");
+
+      const hasLegacy =
+        hasTable("feed_inventory_lots") &&
+        hasTable("feed_inventory_txns") &&
+        hasTable("feed_storages") &&
+        hasTable("feed_lots");
+
+      // -------------------------
+      // POOLED INVENTORY (V12+)
+      // -------------------------
+      if (hasPooled) {
+        // Snapshot grouped by Storage + Feed Type + Unit
+        const snapshot = queryAll(`
+          SELECT
+            s.name AS storage,
+            fl.name AS feed_type,
+            fl.unit AS unit,
+            ROUND(SUM(
+              CASE UPPER(it.type)
+                WHEN 'ADD' THEN it.qty
+                WHEN 'REMOVE' THEN -it.qty
+                WHEN 'ADJUST' THEN it.qty
+                ELSE 0
+              END
+            ), 3) AS on_hand
+          FROM feed_inventory_pool_txns it
+          JOIN feed_inventory_pools p ON p.id = it.pool_id
+          JOIN feed_storages s ON s.id = p.storage_id
+          JOIN feed_lots fl ON fl.id = p.feed_lot_id
+          GROUP BY s.name, fl.name, fl.unit
+          ORDER BY s.name ASC, fl.name ASC
+        `);
+
+        if (snapshot.length > 0) {
+          renderTable(snapshot);
+          setStatus("Loaded Inventory snapshot (pooled).", "ok");
+          return;
+        }
+
+        // If empty, show diagnostics: do we have pools? do we have txns?
+        const counts = queryAll(`
+          SELECT
+            (SELECT COUNT(*) FROM feed_inventory_pools) AS pool_count,
+            (SELECT COUNT(*) FROM feed_inventory_pool_txns) AS txn_count
+        `);
+
+        const poolList = queryAll(`
+          SELECT
+            s.name AS storage,
+            fl.name AS feed_type,
+            fl.unit AS unit,
+            p.notes AS notes,
+            p.created_at AS created_at
+          FROM feed_inventory_pools p
+          JOIN feed_storages s ON s.id = p.storage_id
+          JOIN feed_lots fl ON fl.id = p.feed_lot_id
+          ORDER BY s.name ASC, fl.name ASC
+          LIMIT 500
+        `);
+
+        viewEl.innerHTML = `
+          <div class="warn">
+            No pooled inventory totals to show yet.
+          </div>
+          <div class="muted" style="margin-top:8px;">
+            Pools: <b>${counts[0]?.pool_count ?? 0}</b> •
+            Pool txns: <b>${counts[0]?.txn_count ?? 0}</b>
+          </div>
+          <div class="muted" style="margin-top:8px;">
+            If Pools is 0, you likely never added inventory into storage yet (or you’re on legacy inventory only).
+            If Pools &gt; 0 but txns is 0, pools exist but no ADD/REMOVE/ADJUST were saved.
+          </div>
+          <div style="margin-top:12px;">
+            <div class="pill">Pools found</div>
+            <div id="poolTable"></div>
+          </div>
+        `;
+
+        const poolTableHost = document.getElementById("poolTable");
+        if (!poolList.length) {
+          poolTableHost.innerHTML = `<div class="muted">No pools found.</div>`;
+          setCountPill(0, 0);
+        } else {
+          // render pools table (no photos)
+          const cols = Object.keys(poolList[0]);
+          let html = "<table><thead><tr>";
+          for (const c of cols) html += `<th>${escapeHtml(c)}</th>`;
+          html += "</tr></thead><tbody>";
+          for (const r of poolList) {
+            html += "<tr>";
+            for (const c of cols) html += `<td>${escapeHtml(r[c])}</td>`;
+            html += "</tr>";
+          }
+          html += "</tbody></table>";
+          poolTableHost.innerHTML = html;
+          setCountPill(poolList.length, poolList.length);
+        }
+
+        setStatus("Inventory: pooled tables found, but no totals.", "warn");
         return;
       }
 
-      const rows = queryAll(`
-        SELECT
-          s.name AS storage,
-          fl.name AS feed_type,
-          fl.unit AS unit,
-          ROUND(SUM(
-            CASE it.type
-              WHEN 'ADD' THEN it.qty
-              WHEN 'REMOVE' THEN -it.qty
-              WHEN 'ADJUST' THEN it.qty
-              ELSE 0
-            END
-          ), 3) AS on_hand
-        FROM feed_inventory_pool_txns it
-        JOIN feed_inventory_pools p ON p.id = it.pool_id
-        JOIN feed_storages s ON s.id = p.storage_id
-        JOIN feed_lots fl ON fl.id = p.feed_lot_id
-        GROUP BY s.name, fl.name, fl.unit
-        ORDER BY s.name ASC, fl.name ASC
-      `);
+      // -------------------------
+      // LEGACY INVENTORY (V11)
+      // -------------------------
+      if (hasLegacy) {
+        const legacySnapshot = queryAll(`
+          SELECT
+            s.name AS storage,
+            fl.name AS feed_type,
+            fl.unit AS unit,
+            ROUND(SUM(
+              CASE UPPER(it.type)
+                WHEN 'ADD' THEN it.qty
+                WHEN 'REMOVE' THEN -it.qty
+                WHEN 'ADJUST' THEN it.qty
+                ELSE 0
+              END
+            ), 3) AS on_hand
+          FROM feed_inventory_txns it
+          JOIN feed_inventory_lots il ON il.id = it.lot_id
+          JOIN feed_storages s ON s.id = il.storage_id
+          JOIN feed_lots fl ON fl.id = il.feed_lot_id
+          GROUP BY s.name, fl.name, fl.unit
+          ORDER BY s.name ASC, fl.name ASC
+        `);
 
-      renderTable(rows);
-      setStatus("Loaded Inventory snapshot (pooled).", "ok");
+        if (legacySnapshot.length > 0) {
+          renderTable(legacySnapshot);
+          setStatus("Loaded Inventory snapshot (legacy batches).", "ok");
+          return;
+        }
+
+        const counts = queryAll(`
+          SELECT
+            (SELECT COUNT(*) FROM feed_inventory_lots) AS lot_count,
+            (SELECT COUNT(*) FROM feed_inventory_txns) AS txn_count
+        `);
+
+        viewEl.innerHTML = `
+          <div class="warn">Legacy inventory tables found, but no totals to show.</div>
+          <div class="muted" style="margin-top:8px;">
+            Lots: <b>${counts[0]?.lot_count ?? 0}</b> •
+            Txns: <b>${counts[0]?.txn_count ?? 0}</b>
+          </div>
+        `;
+        setCountPill(0, 0);
+        setStatus("Inventory: legacy tables found, but empty.", "warn");
+        return;
+      }
+
+      // -------------------------
+      // NONE FOUND
+      // -------------------------
+      viewEl.innerHTML = `
+        <div class="warn">
+          This backup doesn’t include inventory tables.
+        </div>
+        <div class="muted" style="margin-top:8px;">
+          Expected pooled (V12+): feed_inventory_pools + feed_inventory_pool_txns<br/>
+          or legacy (V11): feed_inventory_lots + feed_inventory_txns
+        </div>
+      `;
+      setCountPill(0, 0);
+      setStatus("Inventory: no inventory tables found.", "warn");
       return;
     }
+
 
     if (tab === "breeding") {
       if (!hasTable("breeding_sessions") || !hasTable("breeding_exposures")) {
