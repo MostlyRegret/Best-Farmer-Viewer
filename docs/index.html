@@ -5,28 +5,63 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>Best Farmer Backup Viewer</title>
     <style>
-      body { font-family: system-ui, sans-serif; margin: 20px; }
+      :root { color-scheme: light; }
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
+      h2 { margin: 0 0 10px 0; }
+      .muted { opacity: .75; }
       .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+      .card { border: 1px solid #e5e5e5; border-radius: 12px; padding: 14px; margin-top: 14px; }
+      .tabs { display:flex; gap:8px; flex-wrap:wrap; margin-top: 12px; }
+      .tabbtn {
+        border: 1px solid #ddd;
+        background: #fff;
+        padding: 8px 10px;
+        border-radius: 10px;
+        cursor: pointer;
+      }
+      .tabbtn.active { border-color: #333; }
+      .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top: 10px; }
+      input[type="text"] { padding: 8px 10px; border: 1px solid #ddd; border-radius: 10px; min-width: 240px; }
       table { border-collapse: collapse; width: 100%; margin-top: 12px; }
-      th, td { border: 1px solid #ddd; padding: 8px; text-align:left; }
-      img { max-width: 120px; max-height: 120px; border:1px solid #ddd; }
-      .muted { opacity: .7; }
+      th, td { border: 1px solid #eee; padding: 8px; text-align:left; vertical-align: top; }
+      th { background: #fafafa; }
+      img.thumb { max-width: 90px; max-height: 90px; border: 1px solid #ddd; border-radius: 8px; }
+      .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; border: 1px solid #eee; background:#fafafa; font-size: 12px; }
+      .spacer { flex: 1; }
+      .warn { color: #7a4b00; }
+      .err { color: #b00020; }
+      .ok { color: #0a7a2f; }
     </style>
   </head>
   <body>
-    <h2>Best Farmer Backup Viewer (local, no upload)</h2>
+    <h2>Best Farmer Backup Viewer</h2>
+    <div class="muted">Runs locally in your browser. Nothing uploads anywhere.</div>
 
-    <div class="row">
-      <input id="zip" type="file" accept=".zip" />
-      <span id="status" class="muted">Choose a backup zip…</span>
+    <div class="card">
+      <div class="row">
+        <input id="zip" type="file" accept=".zip" />
+        <span id="status" class="muted">Choose a backup zip…</span>
+      </div>
+
+      <div class="tabs" id="tabs" style="display:none;">
+        <button class="tabbtn" data-tab="cattle">Cattle</button>
+        <button class="tabbtn" data-tab="feed">Feed</button>
+        <button class="tabbtn" data-tab="inventory">Inventory</button>
+        <button class="tabbtn" data-tab="breeding">Breeding</button>
+      </div>
+
+      <div class="toolbar" id="toolbar" style="display:none;">
+        <input id="search" type="text" placeholder="Search this tab…" />
+        <span class="spacer"></span>
+        <span class="pill" id="countPill">0 rows</span>
+      </div>
     </div>
 
-    <h3>Cattle</h3>
-    <div id="cattle"></div>
+    <div class="card" id="viewCard" style="display:none;">
+      <div id="view"></div>
+    </div>
 
     <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
-
-    <!-- sql.js: easiest is to host these two files yourself in /docs and reference them -->
     <script src="./sql-wasm.js"></script>
     <script src="./app.js"></script>
   </body>
